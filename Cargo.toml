@@ -1,0 +1,11 @@
+[package]
+name = "srelog"
+version = "0.1.0"
+edition = "2021"
+description = "Лог дежурств: создание записи, пересборка индекса и дайджеста бэклога"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+strip = true
