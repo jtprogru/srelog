@@ -2,6 +2,7 @@
 name = "srelog"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Лог дежурств: создание записи, пересборка индекса и дайджеста бэклога"
 
 [dependencies]
