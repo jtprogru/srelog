@@ -26,6 +26,21 @@ pub struct Notes {
     pub root: PathBuf,
 }
 
+/// Что `init` сделал на диске.
+#[derive(Debug, Default)]
+pub struct InitReport {
+    /// файлы, которых не было
+    pub created: Vec<PathBuf>,
+    /// генерируемые файлы, содержимое которых изменилось
+    pub rebuilt: Vec<PathBuf>,
+}
+
+impl InitReport {
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.rebuilt.is_empty()
+    }
+}
+
 impl Notes {
     /// Корень: явный путь, затем `$SRELOG_ROOT`, затем поиск `oncall/` вверх от cwd.
     pub fn locate(explicit: Option<PathBuf>) -> Res<Self> {
@@ -103,13 +118,13 @@ impl Notes {
 
     /// Заводит `oncall/` со стартовым набором файлов. Существующее не перезаписывает.
     /// Возвращает корень и то, что появилось на диске.
-    pub fn init(root: PathBuf) -> Res<(Self, Vec<PathBuf>)> {
+    pub fn init(root: PathBuf) -> Res<(Self, InitReport)> {
         let oncall = root.join("oncall");
-        let mut created = Vec::new();
+        let mut report = InitReport::default();
         if !oncall.is_dir() {
             fs::create_dir_all(&oncall)
                 .map_err(|e| format!("не создаётся {}: {e}", oncall.display()))?;
-            created.push(oncall.clone());
+            report.created.push(oncall.clone());
         }
 
         for (name, body) in [
@@ -119,24 +134,32 @@ impl Notes {
             let p = oncall.join(name);
             if !p.exists() {
                 write(&p, body)?;
-                created.push(p);
+                report.created.push(p);
             }
         }
 
         // генерируемые файлы собираются и на пустом наборе записей: журнал сразу консистентен
         let notes = Notes { root };
-        let fresh: Vec<bool> = ["INDEX.md", "BACKLOG.md"]
-            .iter()
-            .map(|n| !oncall.join(n).exists())
-            .collect();
-        let generated = [notes.write_index()?, notes.write_backlog()?];
-        for (p, fresh) in generated.into_iter().zip(fresh) {
-            if fresh {
-                created.push(p);
+        for (name, body) in [
+            ("INDEX.md", notes.render_index()?),
+            ("BACKLOG.md", notes.render_backlog()?),
+        ] {
+            let p = oncall.join(name);
+            match fs::read_to_string(&p) {
+                Ok(old) if old == body => {} // на диске уже ровно это, mtime не трогаем
+                Ok(_) => {
+                    write(&p, &body)?;
+                    report.rebuilt.push(p);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    write(&p, &body)?;
+                    report.created.push(p);
+                }
+                Err(e) => return Err(format!("не читается {}: {e}", p.display())),
             }
         }
 
-        Ok((notes, created))
+        Ok((notes, report))
     }
 
     /// Создаёт запись, если её ещё нет. Возвращает путь и признак «создали сейчас».
@@ -176,7 +199,8 @@ impl Notes {
             .collect())
     }
 
-    pub fn write_index(&self) -> Res<PathBuf> {
+    /// Содержимое INDEX.md: свежие дежурства сверху.
+    pub fn render_index(&self) -> Res<String> {
         let mut entries = self.entries()?;
         entries.reverse(); // свежие сверху
 
@@ -203,12 +227,17 @@ impl Notes {
             ));
         }
 
+        Ok(out)
+    }
+
+    pub fn write_index(&self) -> Res<PathBuf> {
         let p = self.oncall().join("INDEX.md");
-        write(&p, &out)?;
+        write(&p, &self.render_index()?)?;
         Ok(p)
     }
 
-    pub fn write_backlog(&self) -> Res<PathBuf> {
+    /// Содержимое BACKLOG.md: строки из всех записей, отсортированные.
+    pub fn render_backlog(&self) -> Res<String> {
         let mut rows: Vec<String> = Vec::new();
         for e in &self.entries()? {
             let text = read(&e.path)?;
@@ -231,8 +260,12 @@ impl Notes {
             out.push('\n');
         }
 
+        Ok(out)
+    }
+
+    pub fn write_backlog(&self) -> Res<PathBuf> {
         let p = self.oncall().join("BACKLOG.md");
-        write(&p, &out)?;
+        write(&p, &self.render_backlog()?)?;
         Ok(p)
     }
 }
@@ -423,15 +456,22 @@ mod tests {
     #[test]
     fn init_creates_layout() {
         let root = temp_root("init-layout");
-        let (notes, created) = Notes::init(root.clone()).unwrap();
+        let (notes, report) = Notes::init(root.clone()).unwrap();
 
         assert_eq!(notes.root, root);
         for name in ["TEMPLATE.md", "README.md", "INDEX.md", "BACKLOG.md"] {
             let p = notes.oncall().join(name);
             assert!(p.is_file(), "нет {}", p.display());
-            assert!(created.contains(&p), "{name} не отмечен как созданный");
+            assert!(
+                report.created.contains(&p),
+                "{name} не отмечен как созданный"
+            );
         }
-        assert!(created.contains(&notes.oncall()));
+        assert!(report.created.contains(&notes.oncall()));
+        assert!(
+            report.rebuilt.is_empty(),
+            "на пустом месте нечего пересобирать"
+        );
         // каталог года заводится только первой записью
         assert!(!notes.oncall().join("2026").exists());
 
@@ -449,12 +489,34 @@ mod tests {
         let template = notes.oncall().join("TEMPLATE.md");
         write(&template, "## Своя секция\n").unwrap();
 
-        let (_, created) = Notes::init(root.clone()).unwrap();
+        let (_, report) = Notes::init(root.clone()).unwrap();
         assert!(
-            created.is_empty(),
-            "повторный init что-то создал: {created:?}"
+            report.is_empty(),
+            "повторный init что-то тронул: {report:?}"
         );
         assert_eq!(read(&template).unwrap(), "## Своя секция\n");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_reports_rebuilt_files() {
+        let root = temp_root("init-rebuilt");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+        notes.ensure_entry("2026-09-02").unwrap();
+        notes.write_index().unwrap();
+        notes.write_backlog().unwrap();
+
+        let index = notes.oncall().join("INDEX.md");
+        write(&index, "# Индекс\n\nручная правка\n").unwrap();
+
+        let (_, report) = Notes::init(root.clone()).unwrap();
+        assert!(report.created.is_empty(), "лишнее создано: {report:?}");
+        assert_eq!(report.rebuilt, vec![index.clone()], "отчёт не про то");
+        assert!(read(&index).unwrap().contains("2026/2026-09-02.md"));
+
+        // BACKLOG.md не менялся — в отчёт он не попал и остался нетронутым
+        assert!(!report.rebuilt.contains(&notes.oncall().join("BACKLOG.md")));
 
         let _ = fs::remove_dir_all(&root);
     }

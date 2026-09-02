@@ -123,12 +123,16 @@ fn cmd_init(cli: &Cli) -> Res<()> {
         );
     }
 
-    let (notes, created) = Notes::init(root)?;
-    if created.is_empty() {
+    let (notes, report) = Notes::init(root)?;
+    if report.is_empty() {
         eprintln!("журнал уже заведён, ничего не менял");
     } else {
-        for p in &created {
+        for p in &report.created {
             eprintln!("создано: {}", p.display());
+        }
+        // INDEX.md и BACKLOG.md собираются из записей, ручные правки в них не переживают init
+        for p in &report.rebuilt {
+            eprintln!("пересобрано: {}", p.display());
         }
     }
 
