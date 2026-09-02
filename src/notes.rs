@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::md;
@@ -10,6 +10,9 @@ use crate::Res;
 
 /// Шаблон, зашитый в бинарник: используется, если в репозитории нет oncall/TEMPLATE.md.
 pub const BUILTIN_TEMPLATE: &str = include_str!("../template/entry.md");
+
+/// README каталога заметок: кладётся при `srelog init`, если своего ещё нет.
+pub const BUILTIN_README: &str = include_str!("../template/oncall-readme.md");
 
 const ENTRY_NAME_LEN: usize = "YYYY-MM-DD.md".len();
 
@@ -44,7 +47,7 @@ impl Notes {
         }
         Err(format!(
             "не нашёл корень заметок: каталога oncall/ нет ни в {}, ни выше.\n\
-             Укажи --root <path> или SRELOG_ROOT.",
+             Укажи --root <path> или SRELOG_ROOT, либо заведи журнал здесь: srelog init",
             cwd.display()
         ))
     }
@@ -53,7 +56,10 @@ impl Notes {
         if root.join("oncall").is_dir() {
             Ok(Notes { root })
         } else {
-            Err(format!("в {} нет каталога oncall/", root.display()))
+            Err(format!(
+                "в {0} нет каталога oncall/\nЗаведи журнал: srelog init {0}",
+                root.display()
+            ))
         }
     }
 
@@ -93,6 +99,44 @@ impl Notes {
             }
         }
         "TBD".to_string()
+    }
+
+    /// Заводит `oncall/` со стартовым набором файлов. Существующее не перезаписывает.
+    /// Возвращает корень и то, что появилось на диске.
+    pub fn init(root: PathBuf) -> Res<(Self, Vec<PathBuf>)> {
+        let oncall = root.join("oncall");
+        let mut created = Vec::new();
+        if !oncall.is_dir() {
+            fs::create_dir_all(&oncall)
+                .map_err(|e| format!("не создаётся {}: {e}", oncall.display()))?;
+            created.push(oncall.clone());
+        }
+
+        for (name, body) in [
+            ("TEMPLATE.md", BUILTIN_TEMPLATE),
+            ("README.md", BUILTIN_README),
+        ] {
+            let p = oncall.join(name);
+            if !p.exists() {
+                write(&p, body)?;
+                created.push(p);
+            }
+        }
+
+        // генерируемые файлы собираются и на пустом наборе записей: журнал сразу консистентен
+        let notes = Notes { root };
+        let fresh: Vec<bool> = ["INDEX.md", "BACKLOG.md"]
+            .iter()
+            .map(|n| !oncall.join(n).exists())
+            .collect();
+        let generated = [notes.write_index()?, notes.write_backlog()?];
+        for (p, fresh) in generated.into_iter().zip(fresh) {
+            if fresh {
+                created.push(p);
+            }
+        }
+
+        Ok((notes, created))
     }
 
     /// Создаёт запись, если её ещё нет. Возвращает путь и признак «создали сейчас».
@@ -195,6 +239,55 @@ impl Notes {
 
 // ---------------------------------------------------------------- файлы
 
+/// Абсолютный путь без `.` и `..`. Симлинки не разрешаются: путь может ещё не существовать.
+pub fn absolute(p: &Path) -> Res<PathBuf> {
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("не читается cwd: {e}"))?
+            .join(p)
+    };
+
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Ok(out)
+}
+
+/// Журнал выше по дереву: заводить второй внутри первого почти всегда опечатка.
+pub fn outer_notes(root: &Path) -> Option<PathBuf> {
+    root.parent()?
+        .ancestors()
+        .find(|d| d.join("oncall").is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Текст предупреждения, если `SRELOG_ROOT` уводит команды не в тот журнал.
+pub fn env_root_conflict(root: &Path, env_root: Option<&str>) -> Option<String> {
+    let env_root = env_root?.trim();
+    if env_root.is_empty() {
+        return None;
+    }
+    let env_path = absolute(Path::new(env_root)).ok()?;
+    if env_path == root {
+        return None;
+    }
+    Some(format!(
+        "SRELOG_ROOT указывает на {} — команды пойдут туда, а не в новый журнал\n\
+         \x20       export SRELOG_ROOT={}",
+        env_path.display(),
+        root.display()
+    ))
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Res<()> {
     let rd = fs::read_dir(dir).map_err(|e| format!("не читается {}: {e}", dir.display()))?;
     for e in rd {
@@ -247,6 +340,15 @@ pub fn write(p: &Path, body: &str) -> Res<()> {
 mod tests {
     use super::*;
 
+    /// Свежий каталог во временной папке; имя уникально по тесту, чтобы гонок не было.
+    fn temp_root(tag: &str) -> PathBuf {
+        let mut p = env::temp_dir();
+        p.push(format!("srelog-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).expect("временный каталог");
+        p
+    }
+
     #[test]
     fn dates_and_names() {
         assert!(check_date("2026-09-01").is_ok());
@@ -264,5 +366,102 @@ mod tests {
         for s in ["Итог смены", "Находки", "Кандидаты в бэклог"] {
             assert!(md::sections(t).iter().any(|x| x == s), "нет секции {s}");
         }
+    }
+
+    #[test]
+    fn init_creates_layout() {
+        let root = temp_root("init-layout");
+        let (notes, created) = Notes::init(root.clone()).unwrap();
+
+        assert_eq!(notes.root, root);
+        for name in ["TEMPLATE.md", "README.md", "INDEX.md", "BACKLOG.md"] {
+            let p = notes.oncall().join(name);
+            assert!(p.is_file(), "нет {}", p.display());
+            assert!(created.contains(&p), "{name} не отмечен как созданный");
+        }
+        assert!(created.contains(&notes.oncall()));
+        // каталог года заводится только первой записью
+        assert!(!notes.oncall().join("2026").exists());
+
+        // после init корень находится обычным путём
+        assert!(Notes::locate(Some(root.clone())).is_ok());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_keeps_existing_files() {
+        let root = temp_root("init-idempotent");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+
+        let template = notes.oncall().join("TEMPLATE.md");
+        write(&template, "## Своя секция\n").unwrap();
+
+        let (_, created) = Notes::init(root.clone()).unwrap();
+        assert!(
+            created.is_empty(),
+            "повторный init что-то создал: {created:?}"
+        );
+        assert_eq!(read(&template).unwrap(), "## Своя секция\n");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn entry_lands_right_after_init() {
+        let root = temp_root("init-then-add");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+
+        let (path, created) = notes.ensure_entry("2026-09-02").unwrap();
+        assert!(created);
+        assert_eq!(path, notes.oncall().join("2026").join("2026-09-02.md"));
+
+        let text = read(&path).unwrap();
+        assert!(text.contains("date: 2026-09-02"));
+        assert!(!text.contains("{{"), "плейсхолдеры остались: {text}");
+
+        notes.write_index().unwrap();
+        assert!(read(&notes.oncall().join("INDEX.md"))
+            .unwrap()
+            .contains("2026/2026-09-02.md"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn outer_notes_spots_nesting() {
+        let root = temp_root("nesting");
+        Notes::init(root.clone()).unwrap();
+
+        let inner = root.join("sub").join("deeper");
+        fs::create_dir_all(&inner).unwrap();
+        assert_eq!(outer_notes(&inner), Some(root.clone()));
+        assert_eq!(outer_notes(&root), None, "свой же oncall/ — не вложенность");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_conflict_only_on_mismatch() {
+        let root = PathBuf::from("/notes/new");
+        assert!(env_root_conflict(&root, None).is_none());
+        assert!(env_root_conflict(&root, Some("")).is_none());
+        assert!(env_root_conflict(&root, Some("/notes/new")).is_none());
+        assert!(env_root_conflict(&root, Some("/notes/new/")).is_none());
+        assert!(env_root_conflict(&root, Some("/notes/../notes/new")).is_none());
+
+        let w = env_root_conflict(&root, Some("/notes/old")).expect("предупреждение");
+        assert!(w.contains("/notes/old"));
+        assert!(w.contains("export SRELOG_ROOT=/notes/new"));
+    }
+
+    #[test]
+    fn absolute_cleans_path() {
+        assert_eq!(
+            absolute(Path::new("/a/./b/../c")).unwrap(),
+            PathBuf::from("/a/c")
+        );
+        let rel = absolute(Path::new("notes")).unwrap();
+        assert!(rel.is_absolute() && rel.ends_with("notes"));
     }
 }
