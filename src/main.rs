@@ -132,11 +132,39 @@ fn cmd_init(cli: &Cli) -> Res<()> {
         }
     }
 
-    // предупреждения не меняют код возврата: это подсказки, а не отказ работать
-    if let Some(w) =
-        notes::env_root_conflict(&notes.root, std::env::var("SRELOG_ROOT").ok().as_deref())
-    {
-        eprintln!("srelog: {w}");
+    // предупреждения и подсказки не меняют код возврата: это подсказки, а не отказ работать
+    let persist = notes::persist_root(&notes.root, std::env::var("SHELL").ok().as_deref());
+    match notes::root_env_state(&notes.root, std::env::var("SRELOG_ROOT").ok().as_deref()) {
+        notes::RootEnv::Matches => {
+            eprintln!("SRELOG_ROOT уже указывает сюда — журнал доступен из любого каталога");
+        }
+        notes::RootEnv::Unset => {
+            eprintln!();
+            eprintln!("srelog ищет журнал через SRELOG_ROOT; без неё он найдётся только изнутри этого каталога.");
+            eprintln!("Закрепи путь в профиле оболочки:");
+            eprintln!();
+            eprintln!("  {}", persist.append);
+            eprintln!();
+            eprintln!("и в текущей сессии:");
+            eprintln!();
+            eprintln!("  {}", persist.session);
+        }
+        notes::RootEnv::Other(old) => {
+            eprintln!();
+            eprintln!(
+                "srelog: SRELOG_ROOT указывает на {} — команды пойдут туда, а не в этот журнал.",
+                old.display()
+            );
+            eprintln!("Перенастрой на новый путь:");
+            eprintln!();
+            eprintln!("  {}", persist.append);
+            eprintln!("  {}", persist.session);
+            eprintln!();
+            eprintln!(
+                "Старую строку из {} потом убери, иначе она так и будет висеть выше.",
+                persist.profile
+            );
+        }
     }
 
     println!("{}", notes.root.display());
