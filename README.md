@@ -22,14 +22,29 @@ cargo install --path .
 
 Журнал заводится одной командой: `init` создаёт `oncall/` с шаблоном записи, README и пустыми `INDEX.md` с `BACKLOG.md`.
 
-```bash
-srelog init ~/sre-notes
-export SRELOG_ROOT=~/sre-notes
+```console
+$ srelog init ~/sre-notes
+создано: /Users/me/sre-notes/oncall
+создано: /Users/me/sre-notes/oncall/TEMPLATE.md
+создано: /Users/me/sre-notes/oncall/README.md
+создано: /Users/me/sre-notes/oncall/INDEX.md
+создано: /Users/me/sre-notes/oncall/BACKLOG.md
+
+srelog ищет журнал через SRELOG_ROOT; без неё он найдётся только изнутри этого каталога.
+Закрепи путь в профиле оболочки:
+
+  echo 'export SRELOG_ROOT="/Users/me/sre-notes"' >> ~/.zshrc
+
+и в текущей сессии:
+
+  export SRELOG_ROOT="/Users/me/sre-notes"
 ```
+
+Команду можно скопировать как есть: профиль выбирается по `$SHELL` (`~/.zshrc`, `~/.bash_profile` или `~/.bashrc`, `~/.config/fish/config.fish` с `set -gx`, иначе `~/.profile`), путь берётся в кавычки. Если переменная уже указывает сюда, `init` просто это подтвердит; если на другой журнал — скажет, куда сейчас уходят команды, и даст строку для замены.
 
 Повторный `init` ничего не перезаписывает: свой `TEMPLATE.md` останется своим. Каталог года не создаётся заранее — его заводит первая запись. Git тут не обязателен, но если каталог всё же репозиторий, имя дежурного возьмётся из его `user.name`.
 
-`init` предупредит, если `SRELOG_ROOT` указывает на другой журнал или если выше по дереву уже есть `oncall/`. Предупреждения идут в stderr и не меняют код возврата.
+Про вложенность `init` тоже предупредит: если выше по дереву уже есть `oncall/`, заводить второй журнал внутри первого почти всегда опечатка. Всё это идёт в stderr и не меняет код возврата, в stdout остаётся только путь корня.
 
 ## Как добавлять
 

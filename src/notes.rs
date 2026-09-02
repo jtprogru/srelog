@@ -270,22 +270,74 @@ pub fn outer_notes(root: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Текст предупреждения, если `SRELOG_ROOT` уводит команды не в тот журнал.
-pub fn env_root_conflict(root: &Path, env_root: Option<&str>) -> Option<String> {
-    let env_root = env_root?.trim();
-    if env_root.is_empty() {
-        return None;
+/// Что говорит `SRELOG_ROOT` про только что заведённый журнал.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RootEnv {
+    /// Переменной нет: журнал найдётся только изнутри своего каталога.
+    Unset,
+    /// Переменная уже указывает сюда.
+    Matches,
+    /// Переменная уводит команды в другой журнал.
+    Other(PathBuf),
+}
+
+pub fn root_env_state(root: &Path, env_root: Option<&str>) -> RootEnv {
+    let raw = env_root.unwrap_or("").trim();
+    if raw.is_empty() {
+        return RootEnv::Unset;
     }
-    let env_path = absolute(Path::new(env_root)).ok()?;
-    if env_path == root {
-        return None;
+    match absolute(Path::new(raw)) {
+        Ok(p) if p == root => RootEnv::Matches,
+        Ok(p) => RootEnv::Other(p),
+        Err(_) => RootEnv::Unset,
     }
-    Some(format!(
-        "SRELOG_ROOT указывает на {} — команды пойдут туда, а не в новый журнал\n\
-         \x20       export SRELOG_ROOT={}",
-        env_path.display(),
-        root.display()
-    ))
+}
+
+/// Как закрепить путь к журналу в оболочке.
+pub struct Persist {
+    /// Файл профиля в виде, пригодном для показа: `~/.zshrc`.
+    pub profile: String,
+    /// Готовая команда: `echo 'export SRELOG_ROOT="..."' >> ~/.zshrc`.
+    pub append: String,
+    /// Та же установка для текущей сессии.
+    pub session: String,
+}
+
+/// Профиль и команды под текущую оболочку. Чистая функция: `$SHELL` приходит снаружи.
+pub fn persist_root(root: &Path, shell: Option<&str>) -> Persist {
+    let name = shell.unwrap_or("").rsplit('/').next().unwrap_or("");
+    let (profile, session) = match name {
+        "zsh" => ("~/.zshrc", export_line(root, false)),
+        "bash" if cfg!(target_os = "macos") => ("~/.bash_profile", export_line(root, false)),
+        "bash" => ("~/.bashrc", export_line(root, false)),
+        "fish" => ("~/.config/fish/config.fish", export_line(root, true)),
+        _ => ("~/.profile", export_line(root, false)),
+    };
+
+    // путь журнала остаётся абсолютным: в двойных кавычках тильда не раскроется
+    Persist {
+        append: format!("echo '{}' >> {profile}", session.replace('\'', "'\\''")),
+        profile: profile.to_string(),
+        session,
+    }
+}
+
+/// Строка установки переменной: `export VAR="..."` или, для fish, `set -gx VAR "..."`.
+fn export_line(root: &Path, fish: bool) -> String {
+    let mut quoted = String::from('"');
+    for c in root.display().to_string().chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+
+    if fish {
+        format!("set -gx SRELOG_ROOT {quoted}")
+    } else {
+        format!("export SRELOG_ROOT={quoted}")
+    }
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Res<()> {
@@ -442,17 +494,65 @@ mod tests {
     }
 
     #[test]
-    fn env_conflict_only_on_mismatch() {
+    fn env_state_reads_variable() {
         let root = PathBuf::from("/notes/new");
-        assert!(env_root_conflict(&root, None).is_none());
-        assert!(env_root_conflict(&root, Some("")).is_none());
-        assert!(env_root_conflict(&root, Some("/notes/new")).is_none());
-        assert!(env_root_conflict(&root, Some("/notes/new/")).is_none());
-        assert!(env_root_conflict(&root, Some("/notes/../notes/new")).is_none());
+        assert_eq!(root_env_state(&root, None), RootEnv::Unset);
+        assert_eq!(root_env_state(&root, Some("")), RootEnv::Unset);
+        assert_eq!(root_env_state(&root, Some("  ")), RootEnv::Unset);
+        assert_eq!(root_env_state(&root, Some("/notes/new")), RootEnv::Matches);
+        assert_eq!(root_env_state(&root, Some("/notes/new/")), RootEnv::Matches);
+        assert_eq!(
+            root_env_state(&root, Some("/notes/../notes/new")),
+            RootEnv::Matches
+        );
+        assert_eq!(
+            root_env_state(&root, Some("/notes/old")),
+            RootEnv::Other(PathBuf::from("/notes/old"))
+        );
+    }
 
-        let w = env_root_conflict(&root, Some("/notes/old")).expect("предупреждение");
-        assert!(w.contains("/notes/old"));
-        assert!(w.contains("export SRELOG_ROOT=/notes/new"));
+    #[test]
+    fn persist_picks_profile_by_shell() {
+        let root = PathBuf::from("/notes/new");
+
+        let zsh = persist_root(&root, Some("/bin/zsh"));
+        assert_eq!(zsh.profile, "~/.zshrc");
+        assert_eq!(zsh.session, r#"export SRELOG_ROOT="/notes/new""#);
+        assert_eq!(
+            zsh.append,
+            r#"echo 'export SRELOG_ROOT="/notes/new"' >> ~/.zshrc"#
+        );
+
+        let bash = persist_root(&root, Some("/opt/homebrew/bin/bash"));
+        let expected = if cfg!(target_os = "macos") {
+            "~/.bash_profile"
+        } else {
+            "~/.bashrc"
+        };
+        assert_eq!(bash.profile, expected);
+        assert!(bash.append.ends_with(expected));
+
+        let fish = persist_root(&root, Some("/usr/local/bin/fish"));
+        assert_eq!(fish.profile, "~/.config/fish/config.fish");
+        assert_eq!(fish.session, r#"set -gx SRELOG_ROOT "/notes/new""#);
+
+        // неизвестная оболочка и пустой $SHELL — общий профиль
+        assert_eq!(persist_root(&root, Some("/bin/ksh")).profile, "~/.profile");
+        assert_eq!(persist_root(&root, None).profile, "~/.profile");
+    }
+
+    #[test]
+    fn persist_quotes_awkward_paths() {
+        let spaced = persist_root(Path::new("/notes/on call"), Some("/bin/zsh"));
+        assert_eq!(spaced.session, r#"export SRELOG_ROOT="/notes/on call""#);
+
+        let quoted = persist_root(Path::new("/notes/it's $HOME"), Some("/bin/zsh"));
+        assert_eq!(quoted.session, r#"export SRELOG_ROOT="/notes/it's \$HOME""#);
+        // одинарная кавычка не рвёт строку echo
+        assert_eq!(
+            quoted.append,
+            r#"echo 'export SRELOG_ROOT="/notes/it'\''s \$HOME"' >> ~/.zshrc"#
+        );
     }
 
     #[test]
