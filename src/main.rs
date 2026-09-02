@@ -1,6 +1,7 @@
 //! srelog — лог дежурств одной командой.
 //!
 //!   srelog add [СЕКЦИЯ] < файл    дописать в запись за сегодня и пересобрать индексы
+//!   srelog init [ПУТЬ]            завести каталог oncall/ под журнал
 //!   srelog shift [ДАТА]           создать пустую запись
 //!   srelog index | backlog | sync пересобрать генерируемые файлы
 
@@ -20,6 +21,8 @@ srelog — лог дежурств
 
   srelog add [СЕКЦИЯ]         дописать в запись то, что пришло на stdin,
                               и пересобрать INDEX.md с BACKLOG.md
+  srelog init [ПУТЬ]          завести журнал: oncall/ с шаблоном и README
+                              (по умолчанию — в текущем каталоге)
   srelog shift [ДАТА]         создать пустую запись из шаблона
   srelog index                пересобрать oncall/INDEX.md
   srelog backlog              пересобрать oncall/BACKLOG.md
@@ -77,6 +80,7 @@ fn run() -> Res<()> {
             print!("{}", notes::BUILTIN_TEMPLATE);
             Ok(())
         }
+        Some("init") => cmd_init(&cli),
         Some("add") => cmd_add(&cli),
         Some("shift") => cmd_shift(&cli),
         Some("index") => {
@@ -101,6 +105,43 @@ fn run() -> Res<()> {
 }
 
 // ---------------------------------------------------------------- команды
+
+fn cmd_init(cli: &Cli) -> Res<()> {
+    let root = match cli.args.first() {
+        Some(p) => PathBuf::from(p),
+        None => match &cli.root {
+            Some(p) => p.clone(),
+            None => std::env::current_dir().map_err(|e| format!("не читается cwd: {e}"))?,
+        },
+    };
+    let root = notes::absolute(&root)?;
+
+    if let Some(outer) = notes::outer_notes(&root) {
+        eprintln!(
+            "srelog: осторожно, выше уже есть журнал: {}/oncall",
+            outer.display()
+        );
+    }
+
+    let (notes, created) = Notes::init(root)?;
+    if created.is_empty() {
+        eprintln!("журнал уже заведён, ничего не менял");
+    } else {
+        for p in &created {
+            eprintln!("создано: {}", p.display());
+        }
+    }
+
+    // предупреждения не меняют код возврата: это подсказки, а не отказ работать
+    if let Some(w) =
+        notes::env_root_conflict(&notes.root, std::env::var("SRELOG_ROOT").ok().as_deref())
+    {
+        eprintln!("srelog: {w}");
+    }
+
+    println!("{}", notes.root.display());
+    Ok(())
+}
 
 fn cmd_add(cli: &Cli) -> Res<()> {
     let notes = Notes::locate(cli.root.clone())?;
