@@ -90,13 +90,19 @@ fn run() -> Res<()> {
         }
         Some("backlog") => {
             let n = Notes::locate(cli.root.clone())?;
-            println!("{}", n.write_backlog()?.display());
+            let (path, backlog) = n.write_backlog()?;
+            // stdout занят путём файла, счётчики уходят в stderr
+            eprintln!(
+                "открыто {}, заведено и снято {}",
+                backlog.open, backlog.closed
+            );
+            println!("{}", path.display());
             Ok(())
         }
         Some("sync") => {
             let n = Notes::locate(cli.root.clone())?;
             println!("{}", n.write_index()?.display());
-            println!("{}", n.write_backlog()?.display());
+            println!("{}", n.write_backlog()?.0.display());
             Ok(())
         }
         Some("sections") => cmd_sections(&cli),

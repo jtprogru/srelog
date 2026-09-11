@@ -41,6 +41,15 @@ impl InitReport {
     }
 }
 
+/// Собранный BACKLOG.md и сколько кандидатов легло в каждый раздел.
+pub struct Backlog {
+    pub text: String,
+    /// без статуса, основная таблица
+    pub open: usize,
+    /// со статусом, раздел «Заведено и снято»
+    pub closed: usize,
+}
+
 impl Notes {
     /// Корень: явный путь, затем `$SRELOG_ROOT`, затем поиск `oncall/` вверх от cwd.
     pub fn locate(explicit: Option<PathBuf>) -> Res<Self> {
@@ -142,7 +151,7 @@ impl Notes {
         let notes = Notes { root };
         for (name, body) in [
             ("INDEX.md", notes.render_index()?),
-            ("BACKLOG.md", notes.render_backlog()?),
+            ("BACKLOG.md", notes.render_backlog()?.text),
         ] {
             let p = oncall.join(name);
             match fs::read_to_string(&p) {
@@ -236,17 +245,24 @@ impl Notes {
         Ok(p)
     }
 
-    /// Содержимое BACKLOG.md: строки из всех записей, отсортированные.
-    pub fn render_backlog(&self) -> Res<String> {
-        let mut rows: Vec<String> = Vec::new();
+    /// Содержимое BACKLOG.md: открытые кандидаты из всех записей, под ними заведённые и снятые.
+    pub fn render_backlog(&self) -> Res<Backlog> {
+        let mut open: Vec<String> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
         for e in &self.entries()? {
             let text = read(&e.path)?;
             let date = md::front(&text, "date").unwrap_or_else(|| e.rel.clone());
             for row in md::backlog_rows(&text) {
-                rows.push(format!("{row} | [{date}]({}) |", e.rel));
+                let line = format!("{} | [{date}]({}) |", row.text, e.rel);
+                if row.status.is_empty() {
+                    open.push(line);
+                } else {
+                    closed.push(line);
+                }
             }
         }
-        rows.sort();
+        open.sort();
+        closed.sort();
 
         let mut out = String::from(
             "# Кандидаты в бэклог из дежурств\n\n\
@@ -255,18 +271,36 @@ impl Notes {
              | Направление | Что завести | Основание | Дежурство |\n\
              |-------------|-------------|-----------|-----------|\n",
         );
-        for r in rows {
-            out.push_str(&r);
+        for r in &open {
+            out.push_str(r);
             out.push('\n');
         }
 
-        Ok(out)
+        // без статусов раздела нет, и журнал без четвёртой колонки собирается как раньше
+        if !closed.is_empty() {
+            out.push_str(
+                "\n## Заведено и снято\n\n\
+                 | Направление | Что завести | Основание | Статус | Дежурство |\n\
+                 |-------------|-------------|-----------|--------|-----------|\n",
+            );
+            for r in &closed {
+                out.push_str(r);
+                out.push('\n');
+            }
+        }
+
+        Ok(Backlog {
+            text: out,
+            open: open.len(),
+            closed: closed.len(),
+        })
     }
 
-    pub fn write_backlog(&self) -> Res<PathBuf> {
+    pub fn write_backlog(&self) -> Res<(PathBuf, Backlog)> {
         let p = self.oncall().join("BACKLOG.md");
-        write(&p, &self.render_backlog()?)?;
-        Ok(p)
+        let backlog = self.render_backlog()?;
+        write(&p, &backlog.text)?;
+        Ok((p, backlog))
     }
 }
 
@@ -538,6 +572,140 @@ mod tests {
         assert!(read(&notes.oncall().join("INDEX.md"))
             .unwrap()
             .contains("2026/2026-09-02.md"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Запись с одной секцией бэклога: остальное BACKLOG.md не читает.
+    fn put_backlog(notes: &Notes, date: &str, table: &str) {
+        let p = notes.entry_path(date);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        write(
+            &p,
+            &format!("---\ndate: {date}\n---\n\n## Кандидаты в бэклог\n\n{table}"),
+        )
+        .unwrap();
+    }
+
+    const BACKLOG_HEAD: &str = "\
+# Кандидаты в бэклог из дежурств
+
+Сгенерировано `srelog backlog` из секций «Кандидаты в бэклог». Правки вносить в сами записи.
+
+| Направление | Что завести | Основание | Дежурство |
+|-------------|-------------|-----------|-----------|
+";
+
+    #[test]
+    fn backlog_without_status_keeps_layout() {
+        let root = temp_root("backlog-plain");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+        put_backlog(
+            &notes,
+            "2026-09-01",
+            "\
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| tooling | Тул `quota_check(project_id)` | Бридж не видит квоты |
+| infra   | Выровненная строка     | С пробелами              |
+",
+        );
+        put_backlog(
+            &notes,
+            "2026-09-02",
+            "\
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| access | Чтение квот | exec заблокирован |
+",
+        );
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(
+            backlog.text,
+            format!(
+                "{BACKLOG_HEAD}\
+| access | Чтение квот | exec заблокирован | [2026-09-02](2026/2026-09-02.md) |
+| infra   | Выровненная строка     | С пробелами | [2026-09-01](2026/2026-09-01.md) |
+| tooling | Тул `quota_check(project_id)` | Бридж не видит квоты | [2026-09-01](2026/2026-09-01.md) |
+"
+            )
+        );
+        assert_eq!((backlog.open, backlog.closed), (3, 0));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backlog_moves_rows_with_status_to_own_section() {
+        let root = temp_root("backlog-status");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+        put_backlog(
+            &notes,
+            "2026-09-03",
+            "\
+| Направление | Что завести | Основание | Статус |
+|-------------|-------------|-----------|--------|
+| tooling | Тул `quota_check(project_id)` | Бридж не видит квоты | |
+| infra | Обновить драйвер хранилища | Тихая порча данных | [PROJ-123](https://tracker.example/PROJ-123) |
+| infra | Обновить драйвер хранилища | Рецидив | повтор 2026-09-03 |
+",
+        );
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(
+            backlog.text,
+            format!(
+                "{BACKLOG_HEAD}\
+| tooling | Тул `quota_check(project_id)` | Бридж не видит квоты | [2026-09-03](2026/2026-09-03.md) |
+
+## Заведено и снято
+
+| Направление | Что завести | Основание | Статус | Дежурство |
+|-------------|-------------|-----------|--------|-----------|
+| infra | Обновить драйвер хранилища | Рецидив | повтор 2026-09-03 | [2026-09-03](2026/2026-09-03.md) |
+| infra | Обновить драйвер хранилища | Тихая порча данных | [PROJ-123](https://tracker.example/PROJ-123) | [2026-09-03](2026/2026-09-03.md) |
+"
+            )
+        );
+        assert_eq!((backlog.open, backlog.closed), (1, 2));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backlog_mixes_three_and_four_cells_in_one_table() {
+        let root = temp_root("backlog-mixed");
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+        put_backlog(
+            &notes,
+            "2026-09-04",
+            "\
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| dev | Ретраи в клиенте | Таймауты на старте |
+| infra | Дашборд квот | Смотрели руками | PROJ-7 |
+| access | Чтение квот | exec заблокирован | |
+",
+        );
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(
+            backlog.text,
+            format!(
+                "{BACKLOG_HEAD}\
+| access | Чтение квот | exec заблокирован | [2026-09-04](2026/2026-09-04.md) |
+| dev | Ретраи в клиенте | Таймауты на старте | [2026-09-04](2026/2026-09-04.md) |
+
+## Заведено и снято
+
+| Направление | Что завести | Основание | Статус | Дежурство |
+|-------------|-------------|-----------|--------|-----------|
+| infra | Дашборд квот | Смотрели руками | PROJ-7 | [2026-09-04](2026/2026-09-04.md) |
+"
+            )
+        );
+        assert_eq!((backlog.open, backlog.closed), (2, 1));
 
         let _ = fs::remove_dir_all(&root);
     }
