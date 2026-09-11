@@ -124,17 +124,21 @@ pub fn section_lead(text: &str, name: &str) -> Option<String> {
 pub struct BacklogRow {
     /// строка как в записи, но не дальше статуса и без хвостовых `|` и пробелов
     pub text: String,
+    /// первая ячейка
+    pub direction: String,
     /// четвёртая ячейка; пустая или отсутствующая — кандидат открыт
     pub status: String,
+    /// номер строки в файле, с единицы
+    pub line: usize,
 }
 
 /// Строки таблицы из секции «Кандидаты в бэклог», без шапки, разделителя и пустых.
 pub fn backlog_rows(text: &str) -> Vec<BacklogRow> {
     let mut rows = Vec::new();
     let mut inside = false;
-    let mut lines = text.lines().peekable();
+    let mut lines = text.lines().zip(1..).peekable();
 
-    while let Some(line) = lines.next() {
+    while let Some((line, number)) = lines.next() {
         if line.starts_with("## ") {
             inside = line.contains("Кандидаты в бэклог");
             continue;
@@ -151,10 +155,10 @@ pub fn backlog_rows(text: &str) -> Vec<BacklogRow> {
             continue;
         }
         // шапку узнаём по месту, а не по словам: по GFM за ней сразу идёт разделитель
-        if lines.peek().is_some_and(|next| is_delimiter(next)) {
+        if lines.peek().is_some_and(|(next, _)| is_delimiter(next)) {
             continue;
         }
-        rows.push(split_status(line));
+        rows.push(split_cells(line, number));
     }
     rows
 }
@@ -173,20 +177,27 @@ fn is_delimiter(line: &str) -> bool {
     row_body(line).is_some_and(|b| !b.is_empty() && b.chars().all(|c| c == '-' || c == ':'))
 }
 
-/// Отделяет статус, четвёртую ячейку. Ячейки правее отбрасываются: колонок под них нет.
-fn split_status(line: &str) -> BacklogRow {
+/// Режет строку на ячейки: первая — направление, четвёртая — статус.
+/// Ячейки правее статуса отбрасываются: колонок под них нет.
+fn split_cells(line: &str, number: usize) -> BacklogRow {
     // границы ячеек — неэкранированные `|`, нулевая открывает строку
     let bars: Vec<usize> = line
         .char_indices()
         .filter(|&(i, c)| c == '|' && !line[..i].ends_with('\\'))
         .map(|(i, _)| i)
         .collect();
+    let cell = |k: usize| {
+        bars.get(k).map_or("", |&i| {
+            line[i + 1..bars.get(k + 1).copied().unwrap_or(line.len())].trim()
+        })
+    };
     let end = bars.get(4).copied().unwrap_or(line.len());
-    let status = bars.get(3).map_or("", |&i| line[i + 1..end].trim());
     BacklogRow {
         // пустой статус срезается вместе с хвостом: строка выходит та же, что у трёх ячеек
         text: line[..end].trim_end_matches(['|', ' ', '\t']).to_string(),
-        status: status.to_string(),
+        direction: cell(0).to_string(),
+        status: cell(3).to_string(),
+        line: number,
     }
 }
 
@@ -596,6 +607,35 @@ engineer: Кто-то
                     "снято"
                 ),
                 ("| process | Пятая ячейка | Правее статуса", ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_rows_know_direction_and_line() {
+        let t = "\
+---
+date: 2026-09-01
+---
+
+## Кандидаты в бэклог
+
+| Направление | Что завести | Основание | Статус |
+|-------------|-------------|-----------|--------|
+| infra | Дашборд квот | Смотрели руками |
+|   storage   | Драйвер | Порча данных | PROJ-1 |
+| | Без направления | Забыли заполнить |
+";
+        let got: Vec<(String, usize)> = backlog_rows(t)
+            .into_iter()
+            .map(|r| (r.direction, r.line))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("infra".to_string(), 9),
+                ("storage".to_string(), 10),
+                (String::new(), 11),
             ]
         );
     }

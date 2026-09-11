@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::config::{self, Config};
 use crate::md;
 use crate::Res;
 
@@ -33,9 +34,12 @@ pub struct InitReport {
     pub created: Vec<PathBuf>,
     /// генерируемые файлы, содержимое которых изменилось
     pub rebuilt: Vec<PathBuf>,
+    /// предупреждения сборки BACKLOG.md
+    pub warnings: Vec<String>,
 }
 
 impl InitReport {
+    /// На диске ничего не поменялось. Предупреждения не в счёт: файлов они не трогают.
     pub fn is_empty(&self) -> bool {
         self.created.is_empty() && self.rebuilt.is_empty()
     }
@@ -48,6 +52,8 @@ pub struct Backlog {
     pub open: usize,
     /// со статусом, раздел «Заведено и снято»
     pub closed: usize,
+    /// незнакомые направления и сломанный srelog.toml; сборку они не останавливают
+    pub warnings: Vec<String>,
 }
 
 impl Notes {
@@ -105,6 +111,24 @@ impl Notes {
         }
     }
 
+    /// Настройки из `srelog.toml` в корне. Нет файла — нет и списка направлений.
+    /// Нечитаемый или сломанный файл журнал не останавливает: настройки пустые, причина вторым значением.
+    fn config(&self) -> (Config, Option<String>) {
+        let p = self.root.join(config::FILE);
+        let problem = match fs::read_to_string(&p) {
+            Ok(text) => match config::parse(&text) {
+                Ok(cfg) => return (cfg, None),
+                Err((line, e)) => format!("{}:{line}: {e}", p.display()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
+            Err(e) => format!("не читается {}: {e}", p.display()),
+        };
+        (
+            Config::default(),
+            Some(format!("{problem}; направления не проверяю")),
+        )
+    }
+
     pub fn engineer(&self) -> String {
         if let Ok(v) = env::var("ONCALL_ENGINEER") {
             if !v.trim().is_empty() {
@@ -136,11 +160,11 @@ impl Notes {
             report.created.push(oncall.clone());
         }
 
-        for (name, body) in [
-            ("TEMPLATE.md", BUILTIN_TEMPLATE),
-            ("README.md", BUILTIN_README),
+        for (p, body) in [
+            (oncall.join("TEMPLATE.md"), BUILTIN_TEMPLATE),
+            (oncall.join("README.md"), BUILTIN_README),
+            (root.join(config::FILE), config::BUILTIN),
         ] {
-            let p = oncall.join(name);
             if !p.exists() {
                 write(&p, body)?;
                 report.created.push(p);
@@ -149,9 +173,11 @@ impl Notes {
 
         // генерируемые файлы собираются и на пустом наборе записей: журнал сразу консистентен
         let notes = Notes { root };
+        let backlog = notes.render_backlog()?;
+        report.warnings = backlog.warnings;
         for (name, body) in [
             ("INDEX.md", notes.render_index()?),
-            ("BACKLOG.md", notes.render_backlog()?.text),
+            ("BACKLOG.md", backlog.text),
         ] {
             let p = oncall.join(name);
             match fs::read_to_string(&p) {
@@ -246,14 +272,29 @@ impl Notes {
     }
 
     /// Содержимое BACKLOG.md: открытые кандидаты из всех записей, под ними заведённые и снятые.
+    /// В обеих таблицах направления идут в порядке srelog.toml, незнакомые — в конце и с предупреждением.
     pub fn render_backlog(&self) -> Res<Backlog> {
-        let mut open: Vec<String> = Vec::new();
-        let mut closed: Vec<String> = Vec::new();
+        let (cfg, problem) = self.config();
+        let mut warnings: Vec<String> = problem.into_iter().collect();
+        // ключ сортировки: место направления в списке, затем строка целиком
+        let mut open: Vec<(usize, String)> = Vec::new();
+        let mut closed: Vec<(usize, String)> = Vec::new();
         for e in &self.entries()? {
             let text = read(&e.path)?;
             let date = md::front(&text, "date").unwrap_or_else(|| e.rel.clone());
             for row in md::backlog_rows(&text) {
-                let line = format!("{} | [{date}]({}) |", row.text, e.rel);
+                if cfg.unknown(&row.direction) {
+                    let what = if row.direction.is_empty() {
+                        "направление не заполнено".to_string()
+                    } else {
+                        format!("направления `{}` нет в {}", row.direction, config::FILE)
+                    };
+                    warnings.push(format!("{}:{}: {what}", e.path.display(), row.line));
+                }
+                let line = (
+                    cfg.rank(&row.direction),
+                    format!("{} | [{date}]({}) |", row.text, e.rel),
+                );
                 if row.status.is_empty() {
                     open.push(line);
                 } else {
@@ -271,7 +312,7 @@ impl Notes {
              | Направление | Что завести | Основание | Дежурство |\n\
              |-------------|-------------|-----------|-----------|\n",
         );
-        for r in &open {
+        for (_, r) in &open {
             out.push_str(r);
             out.push('\n');
         }
@@ -283,7 +324,7 @@ impl Notes {
                  | Направление | Что завести | Основание | Статус | Дежурство |\n\
                  |-------------|-------------|-----------|--------|-----------|\n",
             );
-            for r in &closed {
+            for (_, r) in &closed {
                 out.push_str(r);
                 out.push('\n');
             }
@@ -293,6 +334,7 @@ impl Notes {
             text: out,
             open: open.len(),
             closed: closed.len(),
+            warnings,
         })
     }
 
@@ -502,6 +544,12 @@ mod tests {
             );
         }
         assert!(report.created.contains(&notes.oncall()));
+        let cfg = notes.root.join("srelog.toml");
+        assert!(cfg.is_file(), "нет {}", cfg.display());
+        assert!(
+            report.created.contains(&cfg),
+            "srelog.toml не отмечен как созданный"
+        );
         assert!(
             report.rebuilt.is_empty(),
             "на пустом месте нечего пересобирать"
@@ -522,6 +570,8 @@ mod tests {
 
         let template = notes.oncall().join("TEMPLATE.md");
         write(&template, "## Своя секция\n").unwrap();
+        let cfg = notes.root.join("srelog.toml");
+        write(&cfg, "directions = [\"infra\"]\n").unwrap();
 
         let (_, report) = Notes::init(root.clone()).unwrap();
         assert!(
@@ -529,6 +579,7 @@ mod tests {
             "повторный init что-то тронул: {report:?}"
         );
         assert_eq!(read(&template).unwrap(), "## Своя секция\n");
+        assert_eq!(read(&cfg).unwrap(), "directions = [\"infra\"]\n");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -576,6 +627,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Журнал после init со своим srelog.toml; `None` — без файла, как до списка направлений.
+    fn journal(tag: &str, toml: Option<&str>) -> (PathBuf, Notes) {
+        let root = temp_root(tag);
+        let (notes, _) = Notes::init(root.clone()).unwrap();
+        let p = root.join("srelog.toml");
+        match toml {
+            Some(text) => write(&p, text).unwrap(),
+            None => fs::remove_file(&p).unwrap(),
+        }
+        (root, notes)
+    }
+
     /// Запись с одной секцией бэклога: остальное BACKLOG.md не читает.
     fn put_backlog(notes: &Notes, date: &str, table: &str) {
         let p = notes.entry_path(date);
@@ -598,8 +661,7 @@ mod tests {
 
     #[test]
     fn backlog_without_status_keeps_layout() {
-        let root = temp_root("backlog-plain");
-        let (notes, _) = Notes::init(root.clone()).unwrap();
+        let (root, notes) = journal("backlog-plain", None);
         put_backlog(
             &notes,
             "2026-09-01",
@@ -638,8 +700,7 @@ mod tests {
 
     #[test]
     fn backlog_moves_rows_with_status_to_own_section() {
-        let root = temp_root("backlog-status");
-        let (notes, _) = Notes::init(root.clone()).unwrap();
+        let (root, notes) = journal("backlog-status", None);
         put_backlog(
             &notes,
             "2026-09-03",
@@ -675,8 +736,7 @@ mod tests {
 
     #[test]
     fn backlog_mixes_three_and_four_cells_in_one_table() {
-        let root = temp_root("backlog-mixed");
-        let (notes, _) = Notes::init(root.clone()).unwrap();
+        let (root, notes) = journal("backlog-mixed", None);
         put_backlog(
             &notes,
             "2026-09-04",
@@ -706,6 +766,142 @@ mod tests {
             )
         );
         assert_eq!((backlog.open, backlog.closed), (2, 1));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Направления вразнобой, одно не заполнено.
+    const MIXED_DIRECTIONS: &str = "\
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| storage | Обновить драйвер | Тихая порча данных |
+| infra | Дашборд квот | Смотрели руками |
+| | Без направления | Забыли заполнить |
+| access | Чтение квот | exec заблокирован |
+| dev | Ретраи в клиенте | Таймауты на старте |
+";
+
+    /// MIXED_DIRECTIONS за 2026-09-06 в порядке строк целиком, как без списка.
+    const BY_LINE: &str = "\
+| access | Чтение квот | exec заблокирован | [2026-09-06](2026/2026-09-06.md) |
+| dev | Ретраи в клиенте | Таймауты на старте | [2026-09-06](2026/2026-09-06.md) |
+| infra | Дашборд квот | Смотрели руками | [2026-09-06](2026/2026-09-06.md) |
+| storage | Обновить драйвер | Тихая порча данных | [2026-09-06](2026/2026-09-06.md) |
+| | Без направления | Забыли заполнить | [2026-09-06](2026/2026-09-06.md) |
+";
+
+    #[test]
+    fn backlog_without_list_sorts_by_line_quietly() {
+        // нет файла и нет ключа — одно и то же
+        for (tag, toml) in [
+            ("backlog-nolist-file", None),
+            ("backlog-nolist-key", Some("# directions = [\"infra\"]\n")),
+        ] {
+            let (root, notes) = journal(tag, toml);
+            put_backlog(&notes, "2026-09-06", MIXED_DIRECTIONS);
+
+            let backlog = notes.render_backlog().unwrap();
+            assert_eq!(backlog.text, format!("{BACKLOG_HEAD}{BY_LINE}"), "{tag}");
+            assert!(backlog.warnings.is_empty(), "{tag}: {:?}", backlog.warnings);
+
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn backlog_follows_list_and_warns_about_unknown() {
+        let (root, notes) = journal(
+            "backlog-list",
+            Some("directions = [\"infra\", \"access\"]\n"),
+        );
+        put_backlog(&notes, "2026-09-06", MIXED_DIRECTIONS);
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(
+            backlog.text,
+            format!(
+                "{BACKLOG_HEAD}\
+| infra | Дашборд квот | Смотрели руками | [2026-09-06](2026/2026-09-06.md) |
+| access | Чтение квот | exec заблокирован | [2026-09-06](2026/2026-09-06.md) |
+| dev | Ретраи в клиенте | Таймауты на старте | [2026-09-06](2026/2026-09-06.md) |
+| storage | Обновить драйвер | Тихая порча данных | [2026-09-06](2026/2026-09-06.md) |
+| | Без направления | Забыли заполнить | [2026-09-06](2026/2026-09-06.md) |
+"
+            )
+        );
+        let entry = notes.entry_path("2026-09-06");
+        assert_eq!(
+            backlog.warnings,
+            vec![
+                format!(
+                    "{}:9: направления `storage` нет в srelog.toml",
+                    entry.display()
+                ),
+                format!("{}:11: направление не заполнено", entry.display()),
+                format!(
+                    "{}:13: направления `dev` нет в srelog.toml",
+                    entry.display()
+                ),
+            ]
+        );
+        assert_eq!((backlog.open, backlog.closed), (5, 0));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backlog_orders_closed_section_by_list_too() {
+        let (root, notes) = journal(
+            "backlog-list-closed",
+            Some("directions = [\"tooling\", \"infra\"]\n"),
+        );
+        put_backlog(
+            &notes,
+            "2026-09-07",
+            "\
+| Направление | Что завести | Основание | Статус |
+|-------------|-------------|-----------|--------|
+| infra | Обновить драйвер хранилища | Тихая порча данных | PROJ-123 |
+| tooling | Фильтр логов | Grep молчит | снято |
+| tooling | Тул `quota_check` | Бридж не видит квоты | |
+",
+        );
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(
+            backlog.text,
+            format!(
+                "{BACKLOG_HEAD}\
+| tooling | Тул `quota_check` | Бридж не видит квоты | [2026-09-07](2026/2026-09-07.md) |
+
+## Заведено и снято
+
+| Направление | Что завести | Основание | Статус | Дежурство |
+|-------------|-------------|-----------|--------|-----------|
+| tooling | Фильтр логов | Grep молчит | снято | [2026-09-07](2026/2026-09-07.md) |
+| infra | Обновить драйвер хранилища | Тихая порча данных | PROJ-123 | [2026-09-07](2026/2026-09-07.md) |
+"
+            )
+        );
+        assert!(backlog.warnings.is_empty(), "{:?}", backlog.warnings);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broken_config_warns_and_skips_checks() {
+        let (root, notes) = journal("backlog-broken", Some("directions = [\"infra\", access]\n"));
+        put_backlog(&notes, "2026-09-06", MIXED_DIRECTIONS);
+
+        let backlog = notes.render_backlog().unwrap();
+        assert_eq!(backlog.text, format!("{BACKLOG_HEAD}{BY_LINE}"));
+        assert_eq!(
+            backlog.warnings,
+            vec![format!(
+                "{}:1: `access` без кавычек: элементы `directions` — строки; направления не проверяю",
+                root.join("srelog.toml").display()
+            )]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
