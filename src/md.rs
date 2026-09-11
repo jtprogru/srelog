@@ -120,8 +120,16 @@ pub fn section_lead(text: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Строка таблицы кандидатов в бэклог.
+pub struct BacklogRow {
+    /// строка как в записи, но не дальше статуса и без хвостовых `|` и пробелов
+    pub text: String,
+    /// четвёртая ячейка; пустая или отсутствующая — кандидат открыт
+    pub status: String,
+}
+
 /// Строки таблицы из секции «Кандидаты в бэклог», без шапки, разделителя и пустых.
-pub fn backlog_rows(text: &str) -> Vec<String> {
+pub fn backlog_rows(text: &str) -> Vec<BacklogRow> {
     let mut rows = Vec::new();
     let mut inside = false;
     let mut lines = text.lines().peekable();
@@ -146,7 +154,7 @@ pub fn backlog_rows(text: &str) -> Vec<String> {
         if lines.peek().is_some_and(|next| is_delimiter(next)) {
             continue;
         }
-        rows.push(line.trim_end_matches(['|', ' ', '\t']).to_string());
+        rows.push(split_status(line));
     }
     rows
 }
@@ -163,6 +171,23 @@ fn row_body(line: &str) -> Option<String> {
 /// Разделитель под шапкой таблицы: `|---|:--:|`.
 fn is_delimiter(line: &str) -> bool {
     row_body(line).is_some_and(|b| !b.is_empty() && b.chars().all(|c| c == '-' || c == ':'))
+}
+
+/// Отделяет статус, четвёртую ячейку. Ячейки правее отбрасываются: колонок под них нет.
+fn split_status(line: &str) -> BacklogRow {
+    // границы ячеек — неэкранированные `|`, нулевая открывает строку
+    let bars: Vec<usize> = line
+        .char_indices()
+        .filter(|&(i, c)| c == '|' && !line[..i].ends_with('\\'))
+        .map(|(i, _)| i)
+        .collect();
+    let end = bars.get(4).copied().unwrap_or(line.len());
+    let status = bars.get(3).map_or("", |&i| line[i + 1..end].trim());
+    BacklogRow {
+        // пустой статус срезается вместе с хвостом: строка выходит та же, что у трёх ячеек
+        text: line[..end].trim_end_matches(['|', ' ', '\t']).to_string(),
+        status: status.to_string(),
+    }
 }
 
 /// Заголовки секций второго уровня, в порядке следования.
@@ -421,6 +446,11 @@ engineer: Кто-то
 ## Открытые вопросы
 ";
 
+    /// Текст строк бэклога без статусов.
+    fn row_texts(text: &str) -> Vec<String> {
+        backlog_rows(text).into_iter().map(|r| r.text).collect()
+    }
+
     #[test]
     fn frontmatter() {
         assert_eq!(front(SAMPLE, "date").as_deref(), Some("2026-09-01"));
@@ -452,7 +482,7 @@ engineer: Кто-то
     #[test]
     fn backlog_drops_header_separator_and_blank() {
         assert_eq!(
-            backlog_rows(SAMPLE),
+            row_texts(SAMPLE),
             vec![
                 "| tooling | L0-тул `quota_check(project_id)` | Бридж не ходит",
                 "| access | Разрешить чтение квот | exec заблокирован",
@@ -473,7 +503,7 @@ engineer: Кто-то
 | process | Уточнить направление эскалации | Направление эскалации не записано |
 ";
         assert_eq!(
-            backlog_rows(t),
+            row_texts(t),
             vec![
                 "| Направление эскалации | Описать в README | Не знали, куда писать",
                 "| process | Направление эскалации в runbook | Искали полчаса",
@@ -498,7 +528,7 @@ engineer: Кто-то
 | access | Чтение квот | exec заблокирован |
 ";
         assert_eq!(
-            backlog_rows(t),
+            row_texts(t),
             vec![
                 "| infra | Дашборд квот | Смотрели руками",
                 "| access | Чтение квот | exec заблокирован",
@@ -520,11 +550,52 @@ engineer: Кто-то
 
 | tooling | Последний в файле | После него ничего |";
         assert_eq!(
-            backlog_rows(t),
+            row_texts(t),
             vec![
                 "| infra | Дашборд квот | Смотрели руками",
                 "| process | Отбился от таблицы | Пустая строка перед ним",
                 "| tooling | Последний в файле | После него ничего",
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_splits_off_status() {
+        let t = "\
+## Кандидаты в бэклог
+
+| Направление | Что завести | Основание | Статус |
+|-------------|-------------|-----------|--------|
+| dev | Три ячейки | Статуса нет |
+| dev | Пустой статус | Ячейка есть |  |
+| infra | Драйвер | Порча данных | [PROJ-123](https://tracker.example/PROJ-123) |
+| infra | Драйвер | Без закрывающей черты | повтор 2026-09-03
+| tooling | Фильтр `a \\| b` | Экранированная черта | снято |
+| process | Пятая ячейка | Правее статуса | | заметка |
+";
+        let rows = backlog_rows(t);
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.text.as_str(), r.status.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("| dev | Три ячейки | Статуса нет", ""),
+                ("| dev | Пустой статус | Ячейка есть", ""),
+                (
+                    "| infra | Драйвер | Порча данных | [PROJ-123](https://tracker.example/PROJ-123)",
+                    "[PROJ-123](https://tracker.example/PROJ-123)"
+                ),
+                (
+                    "| infra | Драйвер | Без закрывающей черты | повтор 2026-09-03",
+                    "повтор 2026-09-03"
+                ),
+                (
+                    "| tooling | Фильтр `a \\| b` | Экранированная черта | снято",
+                    "снято"
+                ),
+                ("| process | Пятая ячейка | Правее статуса", ""),
             ]
         );
     }
