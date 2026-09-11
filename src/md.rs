@@ -124,8 +124,9 @@ pub fn section_lead(text: &str, name: &str) -> Option<String> {
 pub fn backlog_rows(text: &str) -> Vec<String> {
     let mut rows = Vec::new();
     let mut inside = false;
+    let mut lines = text.lines().peekable();
 
-    for line in text.lines() {
+    while let Some(line) = lines.next() {
         if line.starts_with("## ") {
             inside = line.contains("Кандидаты в бэклог");
             continue;
@@ -134,20 +135,34 @@ pub fn backlog_rows(text: &str) -> Vec<String> {
             continue;
         }
         let line = line.trim_end();
-        if !line.starts_with('|') || line.contains("Направление") {
+        let Some(body) = row_body(line) else {
+            continue;
+        };
+        // пусто — строка-заглушка, одни дефисы — разделитель
+        if body.is_empty() || is_delimiter(line) {
             continue;
         }
-        // содержимое без разметки: пусто — строка-заглушка, одни дефисы — разделитель
-        let body: String = line
-            .chars()
-            .filter(|c| *c != '|' && !c.is_whitespace())
-            .collect();
-        if body.is_empty() || body.chars().all(|c| c == '-' || c == ':') {
+        // шапку узнаём по месту, а не по словам: по GFM за ней сразу идёт разделитель
+        if lines.peek().is_some_and(|next| is_delimiter(next)) {
             continue;
         }
         rows.push(line.trim_end_matches(['|', ' ', '\t']).to_string());
     }
     rows
+}
+
+/// Содержимое строки таблицы без `|` и пробелов. `None` — строка не из таблицы.
+fn row_body(line: &str) -> Option<String> {
+    line.starts_with('|').then(|| {
+        line.chars()
+            .filter(|c| *c != '|' && !c.is_whitespace())
+            .collect()
+    })
+}
+
+/// Разделитель под шапкой таблицы: `|---|:--:|`.
+fn is_delimiter(line: &str) -> bool {
+    row_body(line).is_some_and(|b| !b.is_empty() && b.chars().all(|c| c == '-' || c == ':'))
 }
 
 /// Заголовки секций второго уровня, в порядке следования.
@@ -444,6 +459,74 @@ engineer: Кто-то
             ]
         );
         assert!(backlog_rows(EMPTY).is_empty());
+    }
+
+    #[test]
+    fn backlog_keeps_rows_mentioning_header_words() {
+        let t = "\
+## Кандидаты в бэклог
+
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| Направление эскалации | Описать в README | Не знали, куда писать |
+| process | Направление эскалации в runbook | Искали полчаса |
+| process | Уточнить направление эскалации | Направление эскалации не записано |
+";
+        assert_eq!(
+            backlog_rows(t),
+            vec![
+                "| Направление эскалации | Описать в README | Не знали, куда писать",
+                "| process | Направление эскалации в runbook | Искали полчаса",
+                "| process | Уточнить направление эскалации | Направление эскалации не записано",
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_drops_header_of_every_table() {
+        let t = "\
+## Кандидаты в бэклог
+
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| infra | Дашборд квот | Смотрели руками |
+
+Хвост с прошлой смены:
+
+| Area | What | Why |
+|:-----|:----:|----:|
+| access | Чтение квот | exec заблокирован |
+";
+        assert_eq!(
+            backlog_rows(t),
+            vec![
+                "| infra | Дашборд квот | Смотрели руками",
+                "| access | Чтение квот | exec заблокирован",
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_keeps_row_after_blank_line() {
+        // перед строкой пустая строка, но разделителя за ней нет: это данные, а не шапка
+        let t = "\
+## Кандидаты в бэклог
+
+| Направление | Что завести | Основание |
+|-------------|-------------|-----------|
+| infra | Дашборд квот | Смотрели руками |
+
+| process | Отбился от таблицы | Пустая строка перед ним |
+
+| tooling | Последний в файле | После него ничего |";
+        assert_eq!(
+            backlog_rows(t),
+            vec![
+                "| infra | Дашборд квот | Смотрели руками",
+                "| process | Отбился от таблицы | Пустая строка перед ним",
+                "| tooling | Последний в файле | После него ничего",
+            ]
+        );
     }
 
     #[test]
