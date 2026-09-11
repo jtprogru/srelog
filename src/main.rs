@@ -5,6 +5,7 @@
 //!   srelog shift [ДАТА]           создать пустую запись
 //!   srelog index | backlog | sync пересобрать генерируемые файлы
 
+mod config;
 mod md;
 mod notes;
 
@@ -21,7 +22,8 @@ srelog — лог дежурств
 
   srelog add [СЕКЦИЯ]         дописать в запись то, что пришло на stdin,
                               и пересобрать INDEX.md с BACKLOG.md
-  srelog init [ПУТЬ]          завести журнал: oncall/ с шаблоном и README
+  srelog init [ПУТЬ]          завести журнал: oncall/ с шаблоном и README,
+                              рядом srelog.toml со списком направлений
                               (по умолчанию — в текущем каталоге)
   srelog shift [ДАТА]         создать пустую запись из шаблона
   srelog index                пересобрать oncall/INDEX.md
@@ -91,6 +93,7 @@ fn run() -> Res<()> {
         Some("backlog") => {
             let n = Notes::locate(cli.root.clone())?;
             let (path, backlog) = n.write_backlog()?;
+            warn(&backlog.warnings);
             // stdout занят путём файла, счётчики уходят в stderr
             eprintln!(
                 "открыто {}, заведено и снято {}",
@@ -102,7 +105,9 @@ fn run() -> Res<()> {
         Some("sync") => {
             let n = Notes::locate(cli.root.clone())?;
             println!("{}", n.write_index()?.display());
-            println!("{}", n.write_backlog()?.0.display());
+            let (path, backlog) = n.write_backlog()?;
+            warn(&backlog.warnings);
+            println!("{}", path.display());
             Ok(())
         }
         Some("sections") => cmd_sections(&cli),
@@ -141,6 +146,7 @@ fn cmd_init(cli: &Cli) -> Res<()> {
             eprintln!("пересобрано: {}", p.display());
         }
     }
+    warn(&report.warnings);
 
     // предупреждения и подсказки не меняют код возврата: это подсказки, а не отказ работать
     let persist = notes::persist_root(&notes.root, std::env::var("SHELL").ok().as_deref());
@@ -225,7 +231,7 @@ fn cmd_add(cli: &Cli) -> Res<()> {
 
     if !cli.no_sync {
         notes.write_index()?;
-        notes.write_backlog()?;
+        warn(&notes.write_backlog()?.1.warnings);
     }
     Ok(())
 }
@@ -265,6 +271,13 @@ fn cmd_sections(cli: &Cli) -> Res<()> {
         println!("{s}");
     }
     Ok(())
+}
+
+/// Предупреждения сборки уходят в stderr и код возврата не меняют.
+fn warn(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("srelog: {w}");
+    }
 }
 
 fn collect_input(files: &[PathBuf]) -> Res<String> {
